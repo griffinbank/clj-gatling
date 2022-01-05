@@ -8,7 +8,7 @@
             [schema.core :refer [validate]]
             [clj-gatling.timers :as timers]
             [clojure.core.async :as async :refer [go go-loop close! alts! <! >!]])
-  (:import (java.time LocalDateTime)))
+  (:import (java.time Duration LocalDateTime)))
 
 (set! *warn-on-reflection* true)
 
@@ -83,7 +83,7 @@
                                    true
                                    (:skip-next-after-failure? scenario))
         should-terminate? #(and (:allow-early-termination? scenario)
-                                (not (runners/continue-run? runner @sent-requests simulation-start)))
+                                (not (runners/continue-run? runner @sent-requests simulation-start (LocalDateTime/now))))
         request-failed? #(not (:result %))
         merged-context (or (merge (:context options) (:context scenario)) {})
         final-context (if pre-hook
@@ -112,7 +112,7 @@
           (recur next-steps (conj results result)))))
     result-channel))
 
-(defn- run-scenario-constantly
+(defn- run-concurrent-scenario-constantly
   [{:keys [concurrent-scenarios
            runner
            sent-requests
@@ -137,18 +137,69 @@
             (swap! concurrent-scenarios dec)
             (>! c result)))
         (<! (timers/timeout 200)))
-      (if (runners/continue-run? runner @sent-requests simulation-start)
+      (if (runners/continue-run? runner @sent-requests simulation-start (LocalDateTime/now))
         (recur)
         (close! c)))
     c))
 
-(defn- print-scenario-info [scenario]
-  (println "Running scenario" (:name scenario)
-           "with concurrency" (count (:users scenario))))
+(defn- run-at
+  "Tells the thread when it should next trigger"
+  [run-tracker interval-ns]
+  ;; Randomise the run times by +- 0.5*interval, to prevent sync-ups when distributed
+  (let [jitter (int (- (rand-int interval-ns) (/ interval-ns 2)))]
+    (swap! run-tracker #(.plusNanos ^LocalDateTime % (+ interval-ns jitter)))))
 
-(defn- run-scenario [options scenario]
-  (print-scenario-info scenario)
-  (let [responses (async/merge (map #(run-scenario-constantly options scenario %) (:users scenario)))
+(defn- rate->interval-ns
+  "Converts a rate-per-second of requests to a nanosecond interval between requests"
+  [rate]
+  (->> rate
+       (/ 1000)
+       (* 1000000)))
+
+(defn- run-rate-scenario-constantly
+  [{:keys [concurrent-scenarios
+           run-tracker
+           runner
+           rate
+           rate-distribution
+           prepared-requests
+           sent-requests
+           simulation-start
+           context] :as options}
+   scenario
+   user-id]
+  (let [c (async/chan)
+        interval-ns (if rate-distribution
+                      #(let [progress (runners/calculate-progress runner @sent-requests simulation-start)
+                             target-rate (* rate (rate-distribution progress context))]
+                         (rate->interval-ns target-rate))
+                      (constantly (rate->interval-ns rate)))]
+    (go-loop []
+      (let [next-run (run-at run-tracker (interval-ns))
+            pending  (swap! prepared-requests inc)]
+        ;; This means we only wait if there are not already enough waiting
+        ;; requests to complete the scenario
+        (if (runners/continue-run? runner pending simulation-start next-run)
+          (let [t (LocalDateTime/now)]
+            (when (.isBefore t next-run)
+              (<! (timers/timeout (.toMillis (Duration/between t next-run)))))
+            (swap! concurrent-scenarios inc)
+            (let [result (<! (run-scenario-once options scenario user-id))]
+              (swap! concurrent-scenarios dec)
+              (>! c result))
+            (recur))
+          (close! c))))
+    c))
+
+(defn- print-scenario-info [scenario rate]
+  (println "Running scenario" (:name scenario)
+           (if rate
+             (str "wth rate " rate " users/sec")
+             (str "with concurrency " (count (:users scenario))))))
+
+(defn- run-scenario [run-constantly-fn options scenario]
+  (print-scenario-info scenario (:rate options))
+  (let [responses (async/merge (map #(run-constantly-fn options scenario %) (:users scenario)))
         results (async/chan)]
     (go-loop []
       (if-let [result (<! responses)]
@@ -158,20 +209,30 @@
         (close! results)))
     results))
 
-(defn run-scenarios [{:keys [post-hook context runner concurrency-distribution progress-tracker] :as options}
+(defn run-scenarios [{:keys [post-hook
+                             context
+                             runner
+                             concurrency-distribution
+                             rate
+                             rate-distribution
+                             progress-tracker] :as options}
                      scenarios]
   (println "Running simulation with"
            (runners/runner-info runner)
-           (if concurrency-distribution
-             "using concurrency distribution function"
-             ""))
+           (if rate
+             (if rate-distribution
+               "using request rate with rate distribution function"
+               "using request rate")
+             (if concurrency-distribution
+               "using request concurrency with concurrency distribution function"
+               "using request concurrency")))
   (validate [schema/RunnableScenario] scenarios)
   (let [simulation-start (LocalDateTime/now)
+        prepared-requests (atom 0)
         sent-requests (atom 0)
-        scenario-concurrency-trackers (reduce (fn [m k]
-                                                (assoc m k (atom 0)))
-                                              {}
-                                              (map :name scenarios))
+        scenario-concurrency-trackers (reduce (fn [m k] (assoc m k (atom 0))) {} (map :name scenarios))
+        rate-run-trackers (when rate
+                            (reduce (fn [m k] (assoc m k (atom simulation-start))) {} (map :name scenarios)))
         ;; TODO Maybe use try-finally for stopping
         stop-progress-tracker (progress-tracker/start {:runner runner
                                                        :sent-requests sent-requests
@@ -179,10 +240,15 @@
                                                        :scenario-concurrency-trackers scenario-concurrency-trackers
                                                        :progress-tracker progress-tracker})
         run-scenario-with-opts (fn [{:keys [name] :as scenario}]
-                                 (run-scenario (assoc options
-                                                      :concurrent-scenarios (get scenario-concurrency-trackers name)
-                                                      :simulation-start simulation-start
-                                                      :sent-requests sent-requests)
+                                 (run-scenario (if rate
+                                                 run-rate-scenario-constantly
+                                                 run-concurrent-scenario-constantly)
+                                               (assoc options
+                                                 :concurrent-scenarios (get scenario-concurrency-trackers name)
+                                                 :run-tracker (get rate-run-trackers name)
+                                                 :simulation-start simulation-start
+                                                 :prepared-requests prepared-requests
+                                                 :sent-requests sent-requests)
                                                scenario))
         responses (async/merge (map run-scenario-with-opts scenarios))
         results (async/chan)]

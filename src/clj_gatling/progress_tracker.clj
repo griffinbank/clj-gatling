@@ -7,7 +7,7 @@
     (fn [{:keys [progress sent-requests total-concurrency]}]
       (when-not @finished?
         (let [progress-percent (int (* 100 progress))]
-          (print (str "Progress: " progress-percent "%, concurrency: " total-concurrency " , sent requests: " sent-requests "\r"))
+          (println (str "Progress: " progress-percent "%, concurrency: " total-concurrency " , sent requests: " sent-requests))
           (when (= 100 progress-percent)
             (reset! finished? true)
             (println ""))

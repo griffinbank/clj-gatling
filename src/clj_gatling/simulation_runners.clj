@@ -5,7 +5,7 @@
 
 (defprotocol RunnerProtocol
   (calculate-progress [runner sent-requests start])
-  (continue-run? [runner sent-requests start])
+  (continue-run? [runner sent-requests start next])
   (runner-info [runner]))
 
 (deftype DurationRunner [^Duration duration]
@@ -15,14 +15,14 @@
           time-taken-in-millis (.toMillis (Duration/between ^LocalDateTime start now))
           duration-in-millis (max (.toMillis duration) 1)]
       (float (/ time-taken-in-millis duration-in-millis))))
-  (continue-run? [_ _ start]
-    (.isBefore (LocalDateTime/now) (.plus ^LocalDateTime start duration)))
+  (continue-run? [_ _ start next]
+    (.isBefore ^LocalDateTime next (.plus ^LocalDateTime start duration)))
   (runner-info [_] (str "duration " duration)))
 
 (deftype FixedRequestNumberRunner [number-of-requests]
   RunnerProtocol
-  (calculate-progress [runner sent-requests _]
+  (calculate-progress [_ sent-requests _]
     (float (/ sent-requests number-of-requests)))
-  (continue-run? [runner sent-requests _]
+  (continue-run? [_ sent-requests _ _]
     (< sent-requests number-of-requests))
   (runner-info [_] (str "number of requests " number-of-requests)))
