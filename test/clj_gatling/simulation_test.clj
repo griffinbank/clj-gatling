@@ -127,21 +127,47 @@
                                      :context-after map?
                                      :result true}]}]))))
 
-(deftest when-function-returns-exception-it-is-handled-as-ko
-  (let [s {:name "Exception scenario"
-           :steps [{:name "Throwing" :request (fn [_] (throw (Exception. "Simulated")))}]}
+(defn- remove-ex [result]
+  (let [scenario (first result)
+        req (-> scenario :requests first)
+        reqs (cons (dissoc req :exception) (rest (:requests scenario)))]
+    (cons (assoc scenario :requests reqs) (rest result))))
+
+(deftest when-function-throws-exception-it-is-handled-as-ko
+  (let [ex (Exception. "Simulated")
+        s {:name "Exception scenario"
+           :steps [{:name "Throwing" :request (fn [_] (throw ex))}]}
         result (run-single-scenario s :concurrency 1)]
-    (is (equal? result [{:name "Exception scenario"
-                         :id 0
-                         :start number?
-                         :end number?
-                         :requests [{:name "Throwing"
+    (is (= ex (-> result first :requests first :exception)))
+    (is (equal? (remove-ex result) [{:name "Exception scenario"
                                      :id 0
                                      :start number?
                                      :end number?
-                                     :context-before map?
-                                     :context-after map?
-                                     :result false}]}]))))
+                                     :requests [{:name "Throwing"
+                                                 :id 0
+                                                 :start number?
+                                                 :end number?
+                                                 :context-before map?
+                                                 :context-after map?
+                                                 :result false}]}]))))
+
+(deftest when-function-returns-exception-it-is-handled-as-ko
+  (let [ex (Exception. "Simulated")
+        s {:name "Exception scenario"
+           :steps [{:name "Throwing" :request (fn [_] ex)}]}
+        result (run-single-scenario s :concurrency 1)]
+    (is (= ex (-> result first :requests first :exception)))
+    (is (equal? (remove-ex result) [{:name "Exception scenario"
+                                     :id 0
+                                     :start number?
+                                     :end number?
+                                     :requests [{:name "Throwing"
+                                                 :id 0
+                                                 :start number?
+                                                 :end number?
+                                                 :context-before map?
+                                                 :context-after map?
+                                                 :result false}]}]))))
 
 (deftest when-function-throws-exception-it-is-logged
   (delete-error-logs)
@@ -496,18 +522,21 @@
                                                            (<! (timeout 500))
                                                            [true ctx]))}]}
                                     :concurrency 1
-                                    :timeout-in-ms 100)]
-    (is (equal? result [{:name "scenario"
-                         :start number?
-                         :end number?
-                         :id 0
-                         :requests [{:name "step"
-                                     :id 0
+                                    :timeout-in-ms 100)
+        ex (-> result first :requests first :exception)]
+    (is (= "request timed out" (ex-message ex)))
+    (is (= {:timeout-in-ms 100} (ex-data ex)))
+    (is (equal? (remove-ex result) [{:name "scenario"
                                      :start number?
                                      :end number?
-                                     :context-before map?
-                                     :context-after map?
-                                     :result false}]}]))))
+                                     :id 0
+                                     :requests [{:name "step"
+                                                 :id 0
+                                                 :start number?
+                                                 :end number?
+                                                 :context-before map?
+                                                 :context-after map?
+                                                 :result false}]}]))))
 
 (deftest with-2-arity-concurrency-function
   (let [concurrency-function-called? (atom false)
